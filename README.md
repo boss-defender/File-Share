@@ -1,7 +1,7 @@
 # FileShare
 
 Send files and folders between two computers with **one Python script**.
-Works on the same Wi-Fi or over the internet with **Pinggy** or **ngrok**.
+Works on the same Wi-Fi or over the internet with **Pinggy**, **ngrok** or **Cloudflare**.
 Just paste an address: the connection type is detected automatically.
 
 ```
@@ -10,9 +10,8 @@ python file-share.py
 
 No installs and no extra packages. Only **Python 3.6+** is needed.
 
----
-
-## ✨ Features
+<details>
+<summary><b>✨ Features</b></summary>
 
 - 📁 **Any file, any size**: videos, apps, ZIPs, multi-GB files and whole folders
 - 📦 **Many files at once**: `upload a.mp4 b.zip "My Photos"` or `upload *.jpg`
@@ -22,24 +21,26 @@ No installs and no extra packages. Only **Python 3.6+** is needed.
 - 🔢 **No port changes**: the port in the tunnel address is used automatically
 - ✅ **One double-check question per upload**, even for many files
 - 📊 **Live progress**: percent, speed and time left
-- ⏸️ **Ctrl+Z** cancels a transfer but keeps the connection. **Ctrl+C** quits.
+- ⏸️ **Ctrl+Z** shows a numbered list so you can stop one, several or all transfers. **Ctrl+C** quits.
+- 🌐 **Smart reconnect**: waits patiently if the tunnel is up before the other app, and spares ngrok's free quota
 - ♻️ **Resume**: if the connection drops or the tunnel restarts, the transfer continues where it stopped
 - 🛡️ **Safe**: every block is checksummed, nothing is overwritten, and free disk space is checked first
 - 💻 **Cross-platform**: Windows, macOS, Linux, Android (Termux), iOS (a-Shell / Pythonista)
 
----
+</details>
 
 ## 🚀 Choose your connection
 
-Pick **one** method and follow only that section.
+Pick **one** method, then open its guide under **Setup guides**. Click any ▶ title to open or close it.
 
 | Method | Best for |
 |---|---|
-| [A. Same Wi-Fi (LAN)](#a-same-wi-fi-lan) | Both computers on the same network: fastest |
-| [B. Pinggy TCP](#b-pinggy-tcp) | Over the internet: recommended |
-| [C. Pinggy HTTP / HTTPS](#c-pinggy-http--https) | Over the internet when TCP is blocked |
-| [D. ngrok TCP](#d-ngrok-tcp) | ngrok users with a verified account |
-| [E. ngrok HTTP / HTTPS](#e-ngrok-http--https) | ngrok users, small files |
+| **A. Same Wi-Fi (LAN)** | Both computers on the same network: fastest |
+| **B. Pinggy TCP** | Over the internet: recommended |
+| **C. Pinggy HTTP / HTTPS** | Over the internet when TCP is blocked |
+| **D. ngrok TCP** | ngrok users with a verified account |
+| **E. ngrok HTTP / HTTPS** | ngrok users, small files |
+| **F. Cloudflare Quick Tunnel** | Free, no account needed |
 
 **Who does what**
 
@@ -47,9 +48,10 @@ Pick **one** method and follow only that section.
 - 👤 **User 2** puts that address in `file-share.py`.
 - Only User 2 edits the file. User 1 changes nothing.
 
----
+## 🔌 Setup guides
 
-### A. Same Wi-Fi (LAN)
+<details>
+<summary><b>A. Same Wi-Fi (LAN)</b></summary>
 
 **Step 1: User 1 starts the program**
 ```
@@ -74,9 +76,10 @@ python file-share.py
 
 ✅ Done. Both screens show `Connected`.
 
----
+</details>
 
-### B. Pinggy TCP
+<details>
+<summary><b>B. Pinggy TCP</b></summary>
 
 **Step 1: User 1 starts the tunnel and the program**
 
@@ -112,9 +115,10 @@ python file-share.py
 
 > ⏱️ Free Pinggy tunnels last 60 minutes. User 1 restarts the tunnel and sends the **new** address. User 2 types `connect <new address>` in the running program, and the transfer resumes by itself.
 
----
+</details>
 
-### C. Pinggy HTTP / HTTPS
+<details>
+<summary><b>C. Pinggy HTTP / HTTPS</b></summary>
 
 **Step 1: User 1 starts the tunnel and the program**
 
@@ -151,9 +155,10 @@ python file-share.py
 
 > ⏱️ The 60-minute limit applies here too. See the note in section B.
 
----
+</details>
 
-### D. ngrok TCP
+<details>
+<summary><b>D. ngrok TCP</b></summary>
 
 > ngrok's free plan requires a card to be added to your ngrok account before TCP works.
 
@@ -187,9 +192,10 @@ python file-share.py
 
 ✅ Done.
 
----
+</details>
 
-### E. ngrok HTTP / HTTPS
+<details>
+<summary><b>E. ngrok HTTP / HTTPS</b></summary>
 
 **Step 1: User 1 starts the tunnel and the program**
 
@@ -223,9 +229,53 @@ python file-share.py
 
 > ⚠️ ngrok's free plan includes **1 GB of data per month**. For big files, use Pinggy or LAN.
 
----
+</details>
 
-## 📤 Sending files
+<details>
+<summary><b>F. Cloudflare Quick Tunnel</b></summary>
+
+> Install `cloudflared` first from [Cloudflare's download page](https://developers.cloudflare.com/cloudflare-one/networks/connectors/cloudflare-tunnel/downloads/). No account is needed.
+
+**Step 1: User 1 starts the tunnel and the program**
+
+Terminal 1:
+```bash
+cloudflared tunnel --url http://localhost:4444
+```
+Terminal 2:
+```
+python file-share.py
+```
+Terminal 1 shows an **HTTPS address** like this:
+```
+https://random-words-here.trycloudflare.com
+```
+
+**Step 2: User 1 sends the HTTPS address to User 2**
+
+📨 Copy the whole `https://...trycloudflare.com` address and send it to User 2.
+
+**Step 3: User 2 pastes it and runs the program**
+```python
+PEER_ADDRESS = 'https://random-words-here.trycloudflare.com'
+```
+Save, then run:
+```
+python file-share.py
+```
+
+✅ Done.
+
+> ℹ️ The address changes every time `cloudflared` restarts. Send the new one, and User 2 types `connect <new address>`.
+
+</details>
+
+## 📖 How to use
+
+Click a title to open it.
+
+<details>
+<summary><b>📤 Sending files</b></summary>
 
 Type `upload` and one or more files or folders. You can also drag them into the terminal.
 ```
@@ -243,7 +293,7 @@ Incoming 3 items from laptop (2.10 GB total):
 Do you want to download them? (y/n):
 ```
 
-### The double-check rule
+#### The double-check rule
 
 | You type | Result |
 |---|---|
@@ -258,7 +308,7 @@ When it's accepted, both sides see live progress:
 UP 3 items 45.2% 970 MB/2.10 GB 31.4 MB/s ETA 00:37
 ```
 
-### Sending more while files are moving
+#### Sending more while files are moving
 
 - Type `upload` again at any time. The other user gets a **new question** for the new files.
 - If a question is already open, the new one waits its turn and appears right after.
@@ -266,46 +316,84 @@ UP 3 items 45.2% 970 MB/2.10 GB 31.4 MB/s ETA 00:37
 
 Files are saved to the **`FileShare Downloads`** folder next to the script.
 
----
+</details>
 
-## ⌨️ Commands
+<details>
+<summary><b>⏸️ Stopping files (Ctrl+Z)</b></summary>
+
+Press **Ctrl+Z** (or type `cancel`) at any time. You see every running transfer with a number:
+```
+Running transfers:
+   1. SENDING    movie.mp4     MP4 file      1.42 GB   45.2%
+   2. RECEIVING  photos        folder, 120   690 MB    12.0%
+   3. RECEIVING  song.mp3      MP3 file      8.00 MB   80.5%
+Which to stop?
+```
+
+| You type | What stops |
+|---|---|
+| `2` | Only transfer 2 |
+| `1 3` | Transfers 1 and 3 (put a space between numbers) |
+| `1-3` | Transfers 1, 2 and 3 |
+| `all` | Everything |
+| just **Enter** | Nothing: go back |
+
+Then answer **one** question:
+```
+Stop these 2 transfers? (y/n):
+```
+- `y` stops them. The other user sees which file was interrupted.
+- `n` keeps everything going.
+
+The connection always stays open. Shortcut: `cancel 2 3` jumps straight to the question.
+
+> On iOS there is no Ctrl+Z key, so type `cancel` instead.
+
+</details>
+
+<details>
+<summary><b>⌨️ Commands</b></summary>
 
 | Command | What it does |
 |---|---|
 | `upload <paths>` | Send one or more files or folders |
-| `cancel` or **Ctrl+Z** | Stop **all** running transfers and stay connected |
-| `cancel <number>` | Stop just one transfer (numbers come from `status`) |
+| **Ctrl+Z** or `cancel` | Choose which transfers to stop |
+| `cancel 2 3` | Stop transfers 2 and 3 (after one y/n) |
 | `status` | Show the connection and every transfer with its number |
 | `connect <address>` | Switch to a new address |
 | `exit` or **Ctrl+C** | Quit |
 
-> On iOS there is no Ctrl+Z key, so type `cancel` instead.
+</details>
 
----
-
-## 🛠️ Troubleshooting
+<details>
+<summary><b>🛠️ Troubleshooting</b></summary>
 
 | Problem | Fix |
 |---|---|
 | Stuck on `Connecting...` | Check that User 1's tunnel and program are both running, and the address User 2 pasted is complete (with `tcp://` or `https://` and any port). |
 | `points to this computer itself` | User 1 pasted their own address. Leave `PEER_ADDRESS = ''` on User 1 and send the address to User 2. |
+| `The tunnel is up, but FileShare is not running` | User 1's tunnel works, but the program isn't started. Start `python file-share.py` on User 1's computer: it connects by itself. |
 | `Port 4444 is busy` | Another copy is already running. Close it. |
 | LAN won't connect | Allow Python through the firewall, or use Pinggy. |
 | `one upload can offer up to 1000` | Put the files in a folder and upload the folder: a folder can hold any number of files. |
-| ngrok stopped working | The free 1 GB/month limit was probably reached. Switch to Pinggy. |
+| ngrok stopped working | The free plan allows 1 GB of data, 20,000 HTTP requests and 5,000 TCP connections a month. Switch to Pinggy or Cloudflare. |
 
----
+</details>
 
-## 🔒 Security
+<details>
+<summary><b>🔒 Security</b></summary>
 
 - Nothing is saved without the receiver's double **yes**.
 - Files can never be written outside the download folder.
 - Share your tunnel address only with the person you're sending to, and close the tunnel when you're done.
 
----
+</details>
 
-## 📋 Requirements
+<details>
+<summary><b>📋 Requirements</b></summary>
 
 - Python 3.6 or newer: that's it.
 - Android: [Termux](https://termux.dev) with `pkg install python openssh`
 - iOS: a-Shell or Pythonista
+
+</details>
