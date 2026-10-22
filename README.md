@@ -15,10 +15,12 @@ No installs and no extra packages. Only **Python 3.6+** is needed.
 ## ✨ Features
 
 - 📁 **Any file, any size**: videos, apps, ZIPs, multi-GB files and whole folders
-- 🔁 **Both directions**: both users can send and receive
+- 📦 **Many files at once**: `upload a.mp4 b.zip "My Photos"` or `upload *.jpg`
+- ➕ **Send more anytime**: upload new files while others are still moving
+- 🔁 **Both directions at the same time**: download and upload together
 - 🤖 **Fully automatic**: detects TCP, HTTP, HTTPS, WebSocket and TLS by itself
 - 🔢 **No port changes**: the port in the tunnel address is used automatically
-- ✅ **Double-check prompt** before anything is downloaded
+- ✅ **One double-check question per upload**, even for many files
 - 📊 **Live progress**: percent, speed and time left
 - ⏸️ **Ctrl+Z** cancels a transfer but keeps the connection. **Ctrl+C** quits.
 - ♻️ **Resume**: if the connection drops or the tunnel restarts, the transfer continues where it stopped
@@ -223,21 +225,22 @@ python file-share.py
 
 ---
 
-## 📤 Sending a file
+## 📤 Sending files
 
-Type `upload` and the path (you can also drag the file into the terminal):
+Type `upload` and one or more files or folders. You can also drag them into the terminal.
 ```
-upload C:\Users\me\Videos\movie.mp4
-upload /home/me/Photos
+upload movie.mp4
+upload movie.mp4 song.mp3 "My Photos"
+upload *.jpg
 ```
 
-The other user sees:
+The other user gets **one question** for everything in that upload:
 ```
-Incoming file from laptop:
-  Name : movie.mp4
-  Type : MP4 file
-  Size : 1.42 GB
-Do you want to download it? (y/n):
+Incoming 3 items from laptop (2.10 GB total):
+   1. movie.mp4      MP4 file            1.42 GB
+   2. song.mp3       MP3 file            8.00 MB
+   3. My Photos      folder, 120 file(s) 690 MB
+Do you want to download them? (y/n):
 ```
 
 ### The double-check rule
@@ -252,8 +255,14 @@ Do you want to download it? (y/n):
 
 When it's accepted, both sides see live progress:
 ```
-UP movie.mp4 45.2% 642 MB/1.42 GB 31.4 MB/s ETA 00:25
+UP 3 items 45.2% 970 MB/2.10 GB 31.4 MB/s ETA 00:37
 ```
+
+### Sending more while files are moving
+
+- Type `upload` again at any time. The other user gets a **new question** for the new files.
+- If a question is already open, the new one waits its turn and appears right after.
+- Both users can upload **at the same time**. Downloads and uploads run together.
 
 Files are saved to the **`FileShare Downloads`** folder next to the script.
 
@@ -263,10 +272,11 @@ Files are saved to the **`FileShare Downloads`** folder next to the script.
 
 | Command | What it does |
 |---|---|
-| `upload <path>` | Send a file or folder |
-| `cancel` or **Ctrl+Z** | Stop the current transfer and stay connected |
+| `upload <paths>` | Send one or more files or folders |
+| `cancel` or **Ctrl+Z** | Stop **all** running transfers and stay connected |
+| `cancel <number>` | Stop just one transfer (numbers come from `status`) |
+| `status` | Show the connection and every transfer with its number |
 | `connect <address>` | Switch to a new address |
-| `status` | Show the connection and active transfers |
 | `exit` or **Ctrl+C** | Quit |
 
 > On iOS there is no Ctrl+Z key, so type `cancel` instead.
@@ -281,6 +291,7 @@ Files are saved to the **`FileShare Downloads`** folder next to the script.
 | `points to this computer itself` | User 1 pasted their own address. Leave `PEER_ADDRESS = ''` on User 1 and send the address to User 2. |
 | `Port 4444 is busy` | Another copy is already running. Close it. |
 | LAN won't connect | Allow Python through the firewall, or use Pinggy. |
+| `one upload can offer up to 1000` | Put the files in a folder and upload the folder: a folder can hold any number of files. |
 | ngrok stopped working | The free 1 GB/month limit was probably reached. Switch to Pinggy. |
 
 ---

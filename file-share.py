@@ -17,12 +17,18 @@ polling as a last resort) is detected automatically. Interrupted transfers
 resume where they stopped, even after a tunnel expires or a restart.
 
 Commands once connected:
-  upload <file or folder>   offer a file/folder of any type and any size
-  cancel   (or Ctrl+Z)      stop the current upload/download, stay connected
+  upload <files/folders>    offer one or more files/folders, any type and size
+                            (upload a.mp4 b.zip "My Folder" *.jpg)
+  cancel   (or Ctrl+Z)      stop all running uploads/downloads, stay connected
+  cancel <number>           stop just one (numbers are shown by status)
   connect <address>         switch to a new address (e.g. a new tunnel URL)
-  status                    connection and transfer details
+  status                    connection and every transfer with its number
   help                      show the commands
   exit     (or Ctrl+C)      quit
+
+Uploads and downloads run at the same time in both directions. You can
+upload more while others are still running; the other user is asked y/n
+once per upload command.
 
 Cross-platform: Windows, macOS, Linux, Android (Termux), iOS (a-Shell,
 Pythonista). Python 3.6+. Standard library only.
@@ -45,6 +51,7 @@ import threading
 import time
 import zlib
 import base64
+import glob
 import http.client as http_client
 from collections import deque
 
@@ -144,6 +151,9 @@ PROGRESS_EVERY = 0.5
 HEALTHY_WINDOW = 5.0
 RETRY_MAX = 5.0
 KEEPALIVE_IDLE, KEEPALIVE_INTVL, KEEPALIVE_CNT = 20, 5, 3
+MAX_STREAMS = 3                    # uploads streaming at once; the rest wait their turn
+MAX_BATCH = 1000                   # items per upload command (a folder counts as one item)
+GROUP_WAIT = 1.5                   # wait this long for the rest of a multi-file offer (s)
 
 TUNNEL_HEADERS = {
     "User-Agent": "file-share/1",
@@ -285,6 +295,69 @@ def clean_path_arg(arg):
         if os.path.exists(unescaped):
             s = unescaped
     return s
+
+
+def parse_paths(arg):
+    """Split an upload argument into paths: quoted, escaped, dragged, several, or wildcards.
+    Returns (existing paths, missing names)."""
+    s = arg.strip()
+    if not s:
+        return [], []
+    one = clean_path_arg(s)
+    if os.path.exists(one):
+        return [one], []
+    if s.startswith("& "):
+        s = s[2:].strip()
+    if IS_WINDOWS:
+        pat = r'"([^"]*)"|\'([^\']*)\'|(\S+)'
+    else:
+        pat = r'"([^"]*)"|\'([^\']*)\'|((?:\\.|\S)+)'
+    toks = []
+    for m in re.finditer(pat, s):
+        if m.group(1) is not None:
+            toks.append((m.group(1), True))
+        elif m.group(2) is not None:
+            toks.append((m.group(2), True))
+        else:
+            toks.append((m.group(3), False))
+    found, missing = [], []
+    i = 0
+    while i < len(toks):
+        text, quoted = toks[i]
+        p = clean_path_arg(text)
+        if os.path.exists(p):
+            found.append(p)
+            i += 1
+            continue
+        hit = None
+        if not quoted:                     # unquoted name with spaces: join the next words
+            j, acc = i, text
+            while j + 1 < len(toks) and not toks[j + 1][1] and j - i < 30:
+                j += 1
+                acc = acc + " " + toks[j][0]
+                cand = clean_path_arg(acc)
+                if os.path.exists(cand):
+                    hit = (cand, j)
+                    break
+        if hit is not None:
+            found.append(hit[0])
+            i = hit[1] + 1
+            continue
+        if any(c in p for c in "*?["):
+            matches = sorted(glob.glob(p))
+            if matches:
+                found.extend(matches)
+                i += 1
+                continue
+        missing.append(p)
+        i += 1
+    seen, out = set(), []
+    for p in found:
+        k = os.path.normcase(os.path.abspath(p))
+        if k not in seen:
+            seen.add(k)
+            out.append(p)
+    return out, missing
 
 
 def lp(path):
@@ -1617,6 +1690,29 @@ class FileChanged(Exception):
     pass
 
 
+class Batch(object):
+    """Files/folders offered with one upload command: the other user answers once for all."""
+    def __init__(self, members):
+        self.id = os.urandom(6).hex()
+        self.members = members
+        self.said = set()
+        self.lock = threading.Lock()
+
+    def once(self, key):
+        with self.lock:
+            if key in self.said:
+                return False
+            self.said.add(key)
+            return True
+
+    def describe(self):
+        items = self.members
+        names = ", ".join(short(t.name, 24) for t in items[:3])
+        if len(items) > 3:
+            names += " and %d more" % (len(items) - 3)
+        return "%d items (%s total): %s" % (len(items), human(sum(t.size for t in items)), names)
+
+
 class OutTransfer(object):
     """A file or folder this user offered."""
     def __init__(self, app, path):
@@ -1639,9 +1735,15 @@ class OutTransfer(object):
         self.meter = Meter()
         self.started = None
         self.skipped = 0
+        self.batch = None
+        self.num = 0
+        self.ready = False
 
     def terminal(self):
         return self.state in ("done", "refused", "cancelled", "failed")
+
+    def solo(self):
+        return self.batch is None or len(self.batch.members) <= 1
 
     def build_manifest(self):
         if self.kind == "file":
@@ -1650,7 +1752,7 @@ class OutTransfer(object):
                 pass                        # readable?
             self.entries = [(self.path, self.name, st.st_size)]
             self.size = st.st_size
-            ident = [self.name, "file", st.st_size, int(st.st_mtime)]
+            ident = [self.path, self.name, "file", st.st_size, int(st.st_mtime)]
         else:
             entries, dirs = [], []
             for root, dnames, fnames in os.walk(self.path, followlinks=False):
@@ -1678,13 +1780,16 @@ class OutTransfer(object):
             self.entries = [(a, r, s) for a, r, s, _m in entries]
             self.dirs = dirs
             self.size = sum(e[2] for e in self.entries)
-            ident = [self.name, "folder", self.size, [(r, s, m) for _a, r, s, m in entries], dirs]
+            ident = [self.path, self.name, "folder", self.size, [(r, s, m) for _a, r, s, m in entries], dirs]
         self.fid = hashlib.sha256(json.dumps(ident).encode("utf-8")).hexdigest()[:32]
 
     def offer_msg(self, resume):
         msg = {"t": "offer", "tid": self.tid, "fid": self.fid, "name": self.name,
                "kind": self.kind, "size": self.size, "count": len(self.entries),
                "resume": bool(resume)}
+        if self.batch is not None:
+            msg["batch"] = self.batch.id
+            msg["bn"] = max(1, len([t for t in self.batch.members if not t.terminal()]))
         if self.kind == "folder":
             msg["entries"] = [[r, s] for _a, r, s in self.entries]
             msg["dirs"] = self.dirs
@@ -1701,28 +1806,35 @@ class OutTransfer(object):
         finally:
             self.app.transfer_ended()
 
-    def _run(self):
+    def prepare(self):
+        """Read the file/folder list. Returns False (and says why) when it cannot be sent."""
         try:
             self.build_manifest()
         except OSError as exc:
             self.state = "failed"
             say("[!] Cannot read %s: %s" % (self.path, exc.strerror or exc))
-            return
+            return False
         if self.skipped:
             say("[!] %d unreadable item(s) in %s will be skipped." % (self.skipped, self.name))
         if len(json.dumps(self.offer_msg(False))) > MAX_FRAME - 4096:
             self.state = "failed"
             say("[!] %s has too many files to send as one folder. Zip it first, then upload the zip." % self.name)
+            return False
+        self.ready = True
+        self.state = "waiting"
+        return True
+
+    def _run(self):
+        if not self.ready and not self.prepare():
             return
         what = ("folder, %d files" % len(self.entries)) if self.kind == "folder" else "file"
-        self.state = "waiting"
-        if self.app.session is None:
+        if self.app.session is None and self.solo():
             say("[*] %s (%s, %s) will be offered as soon as the other user is connected."
                 % (self.name, what, human(self.size)))
         while not self.terminal():
             sess = self.app.session
             if sess is None or not sess.alive:
-                if self.state in ("offered", "sending"):
+                if self.state in ("offered", "sending", "queued"):
                     self.state = "waiting"
                 self.app.wait_session(1.0)
                 continue
@@ -1732,7 +1844,7 @@ class OutTransfer(object):
                 self.offer_session = sess
                 if not sess.send_ctrl(**self.offer_msg(self.accepted_once)):
                     continue
-                if self.state == "waiting" and not self.accepted_once:
+                if self.state == "waiting" and not self.accepted_once and self.solo():
                     say("[*] Offered %s (%s, %s). Waiting for the other user to answer..."
                         % (self.name, what, human(self.size)))
                 self.state = "offered" if not self.accepted_once else "waiting"
@@ -1745,8 +1857,20 @@ class OutTransfer(object):
                 self.go = None
             if go_sess is not sess:
                 continue
-            self.state = "sending"
-            self._stream(sess, offset)
+            self.state = "queued"
+            if not self.app.acquire_slot(self, sess):
+                continue
+            try:
+                with self.cv:
+                    if self.go is not None and self.go[0] is sess:
+                        offset = self.go[1]       # a newer resume point arrived while queued
+                        self.go = None
+                if self.terminal():
+                    continue
+                self.state = "sending"
+                self._stream(sess, offset)
+            finally:
+                self.app.release_slot(self)
             # all bytes queued: wait for 'complete', a resend request, or a lost link
             with self.cv:
                 while not self.terminal() and self.go is None and sess.alive and self.app.session is sess:
@@ -1798,7 +1922,10 @@ class OutTransfer(object):
         if not ok:
             self.state = "refused"
             extra = (" (%s)" % reason) if reason and reason != "refused" else ""
-            say("[x] The other user refused to download %s.%s" % (self.name, extra))
+            if self.solo():
+                say("[x] The other user refused to download %s.%s" % (self.name, extra))
+            elif self.batch.once("refused" + extra):
+                say("[x] The other user refused to download %s.%s" % (self.batch.describe(), extra))
             with self.cv:
                 self.cv.notify_all()
             return
@@ -1810,11 +1937,17 @@ class OutTransfer(object):
             self.accepted_once = True
             self.started = time.monotonic()
             self.acked = offset
-            if offset:
+            if not self.solo():
+                if self.batch.once("accepted"):
+                    say("[+] Receiver accepted, files are uploading: %s" % self.batch.describe())
+            elif offset:
                 say("[+] Receiver accepted. Resuming %s from %.1f%% (%s already there)."
                     % (self.name, 100.0 * offset / max(1, self.size), human(offset)))
             else:
                 say("[+] Receiver accepted, file is uploading: %s (%s)" % (self.name, human(self.size)))
+        elif not self.solo():
+            if sess is not getattr(self, "_last_go_sess", None) and self.batch.once("resumed%d" % id(sess)):
+                say("[+] Uploads resumed.")
         elif sess is not getattr(self, "_last_go_sess", None):
             say("[+] Upload of %s resumed at %.1f%%." % (self.name, 100.0 * offset / max(1, self.size)))
         self._last_go_sess = sess
@@ -1838,10 +1971,16 @@ class OutTransfer(object):
         self.acked = self.size
         took = time.monotonic() - (self.started or time.monotonic())
         speed = (" at %s/s" % human(self.size / took)) if took > 0.5 else ""
-        say("[+] Upload complete: %s (%s) in %s%s. The other user saved it."
-            % (self.name, human(self.size), fmt_eta(took), speed))
+        if self.solo():
+            say("[+] Upload complete: %s (%s) in %s%s. The other user saved it."
+                % (self.name, human(self.size), fmt_eta(took), speed))
+        else:
+            say("[+] Upload complete: %s (%s)%s" % (self.name, human(self.size), speed))
         with self.cv:
             self.cv.notify_all()
+        if not self.solo() and all(t.terminal() for t in self.batch.members) and self.batch.once("finished"):
+            done = len([t for t in self.batch.members if t.state == "done"])
+            say("[+] Finished: %d of %d items from that upload were sent." % (done, len(self.batch.members)))
 
     def on_remote_cancel(self, reason):
         if self.terminal():
@@ -1853,7 +1992,7 @@ class OutTransfer(object):
         elif was_offer:
             say("[x] The other user refused to download %s." % self.name)
         else:
-            say("[x] File uploading stopped because the other user interrupted it.")
+            say("[x] File uploading stopped because the other user interrupted it (%s)." % self.name)
         with self.cv:
             self.cv.notify_all()
 
@@ -1923,6 +2062,9 @@ class InTransfer(object):
         self.resync_sent = False
         self.meter = Meter()
         self.started = None
+        self.have = 0
+        self.num = 0
+        self.group = None
         self.lock = threading.RLock()
         part_root = os.path.join(app.download_dir, ".fileshare-partial")
         self.part = os.path.join(part_root, self.fid + (".part" if self.kind == "file" else ""))
@@ -1969,10 +2111,9 @@ class InTransfer(object):
                 have = os.path.getsize(part) if os.path.isfile(part) else 0
                 if have > self.size:
                     have = 0
-                self.f = open(part, "r+b" if have else "wb")
-                if have:
-                    self.f.truncate(have)
-                    self.f.seek(have)
+                if not have:
+                    open(part, "wb").close()   # proves the folder is writable; opened on first data
+                self.f = None
                 self.written, self.idx, self.pos = have, 0, have
             else:
                 os.makedirs(lp(self.part), exist_ok=True)
@@ -1998,6 +2139,10 @@ class InTransfer(object):
 
     def write(self, data):
         if self.kind == "file":
+            if self.f is None:             # opened lazily: many queued files never hold handles
+                self.f = open(lp(self.part), "r+b")
+                self.f.truncate(self.written)
+                self.f.seek(self.written)
             self.f.write(data)
             self.written += len(data)
             self.pos = self.written
@@ -2061,8 +2206,9 @@ class InTransfer(object):
         else:
             if not os.path.exists(self.part):
                 open(self.part, "wb").close()
-        dest = unique_path(self.app.download_dir, self.name)
-        os.rename(lp(self.part), lp(dest))
+        with self.app.finalize_lock:
+            dest = unique_path(self.app.download_dir, self.name)
+            os.rename(lp(self.part), lp(dest))
         self._tidy()
         return dest
 
@@ -2109,7 +2255,12 @@ class InTransfer(object):
         if sess is not None:
             sess.send_ctrl(t="progress", tid=self.tid, got=self.size)
             sess.send_ctrl(t="complete", tid=self.tid, saved=os.path.basename(dest))
-        say("[+] Download complete: %s (%s)%s\n    Saved to: %s" % (self.name, human(self.size), speed, dest))
+        g = self.group
+        if g is not None and len(g.items) > 1:
+            say("[+] Download complete: %s (%s)%s" % (self.name, human(self.size), speed))
+            self.app.group_progress(g)
+        else:
+            say("[+] Download complete: %s (%s)%s\n    Saved to: %s" % (self.name, human(self.size), speed, dest))
         self.app.transfer_ended()
 
     def fail(self, sess, reason):
@@ -2120,12 +2271,38 @@ class InTransfer(object):
         self.close_files()
         self.app.send_cancel(self.tid, "down", reason, peer_id=self.peer_id)
         say("[!] Download of %s failed: %s. The partial file was kept; it resumes if sent again." % (self.name, reason))
+        if self.group is not None and len(self.group.items) > 1:
+            self.app.group_progress(self.group)
         self.app.transfer_ended()
 
 
 # ======================================================================
 # The application: connections, transfers, commands
 # ======================================================================
+class OfferGroup(object):
+    """Everything offered by one upload command on the other side: one y/n question."""
+    def __init__(self, peer_id, bid):
+        self.peer_id = peer_id
+        self.bid = bid
+        self.items = []
+        self.expected = 1
+        self.state = "collecting"      # collecting, asking, decided
+        self.decision = None
+        self.answers = []
+        self.last = time.monotonic()
+        self.summarized = False
+
+    def live(self):
+        return [t for t in self.items if t.state == "asking"]
+
+    def size(self):
+        return sum(t.size for t in self.live())
+
+    def title(self):
+        items = self.live() or self.items
+        return items[0].name if len(items) == 1 else "%d items" % len(items)
+
+
 class App(object):
     def __init__(self, peer, port, download_dir):
         self.port = port
@@ -2136,7 +2313,13 @@ class App(object):
         self.sessions = set()
         self.outgoing = {}             # tid -> OutTransfer
         self.incoming = {}             # (peer_id, tid) -> InTransfer
-        self.prompts = deque()         # InTransfer waiting for y/n
+        self.prompts = deque()         # OfferGroup waiting for y/n, oldest first
+        self.groups = {}               # (peer_id, batch id) -> OfferGroup
+        self.serial = 0                # numbers shown by 'status', used by 'cancel <n>'
+        self.slot_cv = threading.Condition()
+        self.slot_wait = deque()       # accepted uploads waiting for a stream slot
+        self.streaming = set()
+        self.finalize_lock = threading.Lock()
         self.pending_cancels = []      # (peer_id, tid, side, reason)
         self.stopping = False
         self.dialer = Dialer(self)
@@ -2155,6 +2338,39 @@ class App(object):
                 if tid not in self.used_tids:
                     self.used_tids.add(tid)
                     return tid
+
+    def next_num(self):
+        with self.lock:
+            self.serial += 1
+            return self.serial
+
+    # ---- upload stream slots: a few files stream at once, the rest queue in order ----
+    def acquire_slot(self, t, sess):
+        with self.slot_cv:
+            if t not in self.slot_wait:
+                self.slot_wait.append(t)
+            got = False
+            try:
+                while True:
+                    if t.terminal() or not sess.alive or self.session is not sess or self.stopping:
+                        return False
+                    while self.slot_wait and self.slot_wait[0] is not t and self.slot_wait[0].terminal():
+                        self.slot_wait.popleft()
+                    if len(self.streaming) < MAX_STREAMS and self.slot_wait and self.slot_wait[0] is t:
+                        self.slot_wait.popleft()
+                        self.streaming.add(t)
+                        got = True
+                        return True
+                    self.slot_cv.wait(0.5)
+            finally:
+                if not got and t in self.slot_wait:
+                    self.slot_wait.remove(t)
+                self.slot_cv.notify_all()
+
+    def release_slot(self, t):
+        with self.slot_cv:
+            self.streaming.discard(t)
+            self.slot_cv.notify_all()
 
     # ---- sessions ----
     def wait_session(self, timeout):
@@ -2228,11 +2444,16 @@ class App(object):
             say("[*] The other user restarted %s; %s is paused. If they send it again it resumes."
                 % (APP_NAME, t.name))
         with self.lock:
-            dropped = [t for t in self.prompts]
+            had_prompt = bool(self.prompts)
             self.prompts.clear()
-        for t in dropped:
-            t.state = "cancelled"
-        if dropped:
+            for g in self.groups.values():
+                if g.state != "decided":
+                    g.state, g.decision = "decided", "n"
+                    for t in g.items:
+                        if t.state == "asking":
+                            t.state = "cancelled"
+        if had_prompt:
+            say("[*] The open question was dropped; the other user will offer again if needed.")
             CONSOLE.set_prompt("> ")
 
     def on_session_end(self, sess):
@@ -2372,90 +2593,224 @@ class App(object):
                     return
                 t.resync_sent = False
                 sess.send_ctrl(t="answer", tid=tid, ok=True, offset=offset)
-                say("[*] Download of %s resumed at %.1f%%." % (t.name, 100.0 * offset / max(1, t.size)))
+                if offset < t.size:
+                    say("[*] Download of %s resumed at %.1f%%." % (t.name, 100.0 * offset / max(1, t.size)))
             elif t.state == "refused":
                 sess.send_ctrl(t="answer", tid=tid, ok=False, reason="refused")
             elif t.state in ("cancelled", "failed"):
                 sess.send_ctrl(t="cancel", tid=tid, side="down", reason="")
             elif t.state == "done":
                 sess.send_ctrl(t="complete", tid=tid, saved=t.name)
-            return                          # 'asking': the prompt is still open
+            return                          # 'asking': the question is still open
         try:
             t = InTransfer(self, sess.peer_id, msg)
         except (KeyError, TypeError, ValueError, IndexError):
             sess.send_ctrl(t="answer", tid=tid, ok=False, reason="the offer was not valid")
             return
-        have = t.existing_bytes()
-        free = disk_free(self.download_dir)
-        if free is not None and t.size - have > free:
-            sess.send_ctrl(t="answer", tid=tid, ok=False, reason="not enough free disk space on the receiver")
-            say("[x] %s (%s) was offered, but there is not enough free disk space (%s free). Refused."
-                % (t.name, human(t.size), human(free)))
-            return
-        t.have = have
         with self.lock:
+            clash = any(o.fid == t.fid and o.state in ("asking", "active") for o in self.incoming.values())
+        if clash:
+            sess.send_ctrl(t="answer", tid=tid, ok=False, reason="the same file is already being downloaded")
+            return
+        t.have = t.existing_bytes()
+        bid = re.sub(r"[^0-9A-Za-z]", "", str(msg.get("batch") or ""))[:32] or ("solo%d" % tid)
+        try:
+            expected = max(1, min(int(msg.get("bn") or 1), 1000000))
+        except (TypeError, ValueError):
+            expected = 1
+        gkey = (sess.peer_id, bid)
+        with self.lock:
+            t.num = self.next_num()
             self.incoming[key] = t
-            self.prompts.append(t)
-            first = len(self.prompts) == 1
+            g = self.groups.get(gkey)
+            if g is None:
+                g = OfferGroup(sess.peer_id, bid)
+                self.groups[gkey] = g
+            g.expected = expected
+            g.last = time.monotonic()
+            t.group = g
+            state = g.state
+            if state != "decided":
+                g.items.append(t)
+            ready = state == "collecting" and len(g.items) >= g.expected
+        if state == "decided":
+            self.apply_decision(t, g.decision, quiet=False)    # late part of an answered offer
+        elif state == "asking":
+            say("[*] One more item joined the offer: %s (%s). Your answer covers it too." % (t.name, human(t.size)))
+        elif ready:
+            self.present(g)
+
+    def group_progress(self, g):
+        """After an item of a multi-item offer ends: one summary when the whole offer is finished."""
+        with self.lock:
+            if g.state != "decided" or g.decision != "y" or g.summarized:
+                return
+            if any(not t.terminal() for t in g.items):
+                return
+            g.summarized = True
+            done = len([t for t in g.items if t.state == "done"])
+            total = len(g.items)
+        say("[+] Finished: %d of %d items downloaded. Saved in: %s" % (done, total, self.download_dir))
+
+    def collect_overdue(self):
+        """Show offers whose remaining parts did not arrive in time."""
+        now = time.monotonic()
+        with self.lock:
+            ready = [g for g in self.groups.values() if g.state == "collecting" and now - g.last > GROUP_WAIT]
+        for g in ready:
+            self.present(g)
+
+    def present(self, g):
+        with self.lock:
+            if g.state != "collecting":
+                return
+            items = g.live()
+            if not items:
+                g.state, g.decision = "decided", "n"
+                return
+            need = sum(max(0, t.size - t.have) for t in items)
+            free = disk_free(self.download_dir)
+            nospace = free is not None and need > free
+            if nospace:
+                g.state, g.decision = "decided", "n"
+            else:
+                g.state = "asking"
+                self.prompts.append(g)
+                first = len(self.prompts) == 1
+        if nospace:
+            for t in items:
+                self.apply_decision(t, "n", quiet=True, reason="not enough free disk space on the receiver")
+            say("[x] %s (%s) was offered, but there is not enough free disk space (%s free). Refused."
+                % (g.title(), human(need), human(free)))
+            return
         if first:
             self.show_prompt()
-
-    def show_prompt(self):
-        with self.lock:
-            t = self.prompts[0] if self.prompts else None
-        if t is None:
-            CONSOLE.set_prompt("> ")
-            return
-        lines = ["", "=" * 50, "Incoming %s from %s:" % (t.kind, self.session.peer_name if self.session else "the other user"),
-                 "  Name : %s" % t.name,
-                 "  Type : %s" % (("folder with %d file(s)" % t.count) if t.kind == "folder"
-                                   else (os.path.splitext(t.name)[1].lstrip(".").upper() or "file") + " file"),
-                 "  Size : %s (%s bytes)" % (human(t.size), "{:,}".format(t.size))]
-        if getattr(t, "have", 0):
-            lines.append("  Note : %.1f%% was already downloaded earlier; it will resume." % (100.0 * t.have / max(1, t.size)))
-        lines.append("=" * 50)
-        if not t.answers:
-            say("\n".join(lines))
-        CONSOLE.set_prompt(self.prompt_text(t), announce=True)
+        else:
+            say("[*] Another offer arrived: %s (%s). It will be asked after the current one."
+                % (g.title(), human(g.size())))
+            CONSOLE.set_prompt(CONSOLE.prompt)
 
     @staticmethod
-    def prompt_text(t):
-        if not t.answers:
-            return "Do you want to download it? (y/n): "
-        last = t.answers[-1]
+    def type_text(t):
+        if t.kind == "folder":
+            return "folder, %d file(s)" % t.count
+        return (os.path.splitext(t.name)[1].lstrip(".").upper() or "unknown") + " file"
+
+    def show_prompt(self):
+        while True:
+            with self.lock:
+                g = self.prompts[0] if self.prompts else None
+                items = g.live() if g is not None else []
+                if g is not None and not items:      # everything in it was withdrawn
+                    self.prompts.popleft()
+                    g.state, g.decision = "decided", "n"
+                    continue
+                waiting = len(self.prompts) - 1
+            break
+        if g is None:
+            CONSOLE.set_prompt("> ")
+            return
+        if not g.answers:
+            who = self.session.peer_name if self.session else "the other user"
+            lines = ["", "=" * 56]
+            if len(items) == 1:
+                t = items[0]
+                lines += ["Incoming %s from %s:" % (t.kind, who),
+                          "  Name : %s" % t.name,
+                          "  Type : %s" % self.type_text(t),
+                          "  Size : %s (%s bytes)" % (human(t.size), "{:,}".format(t.size))]
+                if t.have:
+                    lines.append("  Note : %.1f%% was already downloaded earlier; it will resume."
+                                 % (100.0 * t.have / max(1, t.size)))
+            else:
+                lines.append("Incoming %d items from %s (%s total):" % (len(items), who, human(g.size())))
+                for i, t in enumerate(items[:15], 1):
+                    lines.append("  %2d. %-30s %-18s %10s" % (i, short(t.name, 30), short(self.type_text(t), 18),
+                                                              human(t.size)))
+                if len(items) > 15:
+                    lines.append("      ... and %d more" % (len(items) - 15))
+                resumed = len([t for t in items if t.have])
+                if resumed:
+                    lines.append("  Note : %d item(s) were partly downloaded earlier; they will resume." % resumed)
+            if waiting:
+                lines.append("  (%d more offer(s) waiting after this one)" % waiting)
+            lines.append("=" * 56)
+            say("\n".join(lines))
+        CONSOLE.set_prompt(self.prompt_text(g, len(items)), announce=True)
+
+    @staticmethod
+    def prompt_text(g, count=1):
+        it = "it" if count == 1 else "them"
+        if not g.answers:
+            return "Do you want to download %s? (y/n): " % it
+        last = g.answers[-1]
         word = "download" if last == "y" else "refuse"
-        if len(t.answers) == 1:
-            return "Are you sure? Press %s again to %s it (y/n): " % (last, word)
-        return "You changed your answer. Press %s again to %s it (y/n): " % (last, word)
+        if len(g.answers) == 1:
+            return "Are you sure? Press %s again to %s %s (y/n): " % (last, word, it)
+        return "You changed your answer. Press %s again to %s %s (y/n): " % (last, word, it)
 
     def answer_prompt(self, line):
         with self.lock:
-            t = self.prompts[0] if self.prompts else None
-        if t is None:
+            g = self.prompts[0] if self.prompts else None
+        if g is None:
             return
         a = line.strip().lower()
-        if a in ("yes",):
+        if a == "yes":
             a = "y"
-        if a in ("no",):
+        if a == "no":
             a = "n"
         if a not in ("y", "n"):
             say("Please type y or n.")
-            CONSOLE.set_prompt(self.prompt_text(t), announce=True)
+            CONSOLE.set_prompt(self.prompt_text(g, len(g.live())), announce=True)
             return
-        t.answers.append(a)
+        g.answers.append(a)
         decision = None
-        if len(t.answers) >= 2 and t.answers[-1] == t.answers[-2]:
+        if len(g.answers) >= 2 and g.answers[-1] == g.answers[-2]:
             decision = a
-        elif len(t.answers) >= 4:
+        elif len(g.answers) >= 4:
             decision = "n"
             say("[x] The answers kept changing, so this counts as a refusal.")
         if decision is None:
-            CONSOLE.set_prompt(self.prompt_text(t), announce=True)
+            CONSOLE.set_prompt(self.prompt_text(g, len(g.live())), announce=True)
             return
         with self.lock:
-            if self.prompts and self.prompts[0] is t:
+            if self.prompts and self.prompts[0] is g:
                 self.prompts.popleft()
+            g.state, g.decision = "decided", decision
+            items = g.live()
+        self.decide(items, decision)
+        self.show_prompt()
+
+    def decide(self, items, decision):
+        if not items:
+            return
+        reason = "refused"
+        if decision == "y":
+            need = sum(max(0, t.size - t.have) for t in items)
+            free = disk_free(self.download_dir)
+            if free is not None and need > free:
+                decision, reason = "n", "not enough free disk space on the receiver"
+                say("[x] Not enough free disk space anymore (%s needed, %s free). Refused." % (human(need), human(free)))
+        many = len(items) > 1
+        if many:
+            if decision == "y":
+                say("[+] Downloading %d items (%s). Press Ctrl+Z (or type cancel) to stop."
+                    % (len(items), human(sum(t.size for t in items))))
+            elif reason == "refused":
+                say("[x] You refused to download %d items." % len(items))
+        for t in items:
+            self.apply_decision(t, decision, quiet=many, reason=reason)
+
+    def apply_decision(self, t, decision, quiet=False, reason="refused"):
         sess = self.session if (self.session is not None and self.session.peer_id == t.peer_id) else None
+        with self.lock:
+            if t.state != "asking":
+                return
+        if decision == "y":
+            free = disk_free(self.download_dir)
+            if free is not None and t.size - t.have > free:
+                decision, reason = "n", "not enough free disk space on the receiver"
+                say("[x] Not enough free disk space for %s. Refused." % t.name)
         if decision == "y":
             try:
                 offset = t.prepare()
@@ -2464,22 +2819,23 @@ class App(object):
                 say("[!] Cannot write to %s: %s" % (self.download_dir, exc.strerror or exc))
                 if sess:
                     sess.send_ctrl(t="answer", tid=t.tid, ok=False, reason="the receiver cannot write to its download folder")
-                self.show_prompt()
                 return
             t.state = "active"
             t.started = time.monotonic()
-            say("[+] Downloading %s (%s)%s. Press Ctrl+Z (or type cancel) to stop."
-                % (t.name, human(t.size), (" from %.1f%%" % (100.0 * offset / max(1, t.size))) if offset else ""))
+            if not quiet:
+                say("[+] Downloading %s (%s)%s. Press Ctrl+Z (or type cancel) to stop."
+                    % (t.name, human(t.size), (" from %.1f%%" % (100.0 * offset / max(1, t.size))) if offset else ""))
             if sess:
                 sess.send_ctrl(t="answer", tid=t.tid, ok=True, offset=offset)
-            if t.size == 0:
+            if t.size == 0 or offset >= t.size:
                 t.complete(sess)
         else:
             t.state = "refused"
-            say("[x] You refused to download %s." % t.name)
+            if not quiet and reason == "refused":
+                say("[x] You refused to download %s." % t.name)
             if sess:
-                sess.send_ctrl(t="answer", tid=t.tid, ok=False, reason="refused")
-        self.show_prompt()
+                sess.send_ctrl(t="answer", tid=t.tid, ok=False, reason=reason)
+        self.transfer_ended()
 
     def remote_cancelled_incoming(self, t, reason):
         with self.lock:
@@ -2487,17 +2843,20 @@ class App(object):
                 return
             asking = t.state == "asking"
             t.state = "cancelled"
-            if t in self.prompts:
-                self.prompts.remove(t)
         if asking:
             say("[x] The other user withdrew the offer of %s." % t.name)
-            self.show_prompt()
+            with self.lock:
+                g = self.prompts[0] if self.prompts else None
+            if g is not None and t in g.items:
+                self.show_prompt()
             return
         t.discard()
         if reason:
             say("[x] Download of %s stopped: %s." % (t.name, reason))
         else:
-            say("[x] File downloading stopped because the other user interrupted it.")
+            say("[x] File downloading stopped because the other user interrupted it (%s)." % t.name)
+        if t.group is not None and len(t.group.items) > 1:
+            self.group_progress(t.group)
         self.transfer_ended()
 
     def send_cancel(self, tid, side, reason, peer_id=None):
@@ -2509,58 +2868,127 @@ class App(object):
                 self.pending_cancels.append((peer_id or self.last_peer_id, tid, side, reason))
 
     # ---- user actions ----
+    def cancel_incoming(self, t):
+        with t.lock:
+            if t.state != "active":
+                return False
+            t.state = "cancelled"
+        t.discard()
+        self.send_cancel(t.tid, "down", "", peer_id=t.peer_id)
+        say("[x] You interrupted the downloading of %s." % t.name)
+        if t.group is not None and len(t.group.items) > 1:
+            self.group_progress(t.group)
+        return True
+
     def cancel_active(self):
         did = False
         for t in list(self.outgoing.values()):
             if not t.terminal() and t.state != "preparing":
                 did = t.cancel_local() or did
         for t in list(self.incoming.values()):
-            with t.lock:
-                if t.state != "active":
-                    continue
-                t.state = "cancelled"
-            t.discard()
-            self.send_cancel(t.tid, "down", "", peer_id=t.peer_id)
-            say("[x] You interrupted the downloading of %s." % t.name)
-            did = True
+            did = self.cancel_incoming(t) or did
         if not did:
             say("[*] Nothing to cancel right now.")
         self.transfer_ended()
+
+    def cancel_number(self, arg):
+        try:
+            num = int(arg.strip().lstrip("#"))
+        except ValueError:
+            say("Usage: cancel  (stops everything)  or  cancel <number>  (numbers are shown by status)")
+            return
+        for t in list(self.outgoing.values()):
+            if t.num == num and not t.terminal():
+                if t.state == "preparing":
+                    say("[*] #%d is still being prepared; try again in a moment." % num)
+                else:
+                    t.cancel_local()
+                self.transfer_ended()
+                return
+        for t in list(self.incoming.values()):
+            if t.num == num and not t.terminal():
+                if t.state == "asking":
+                    say("[*] #%d is waiting for your y/n answer; answer n twice to refuse it." % num)
+                else:
+                    self.cancel_incoming(t)
+                self.transfer_ended()
+                return
+        say("[*] No running transfer #%d. Type status to see the numbers." % num)
 
     def transfer_ended(self):
         CONSOLE.set_status(self.status_line())
 
     def upload(self, arg):
         if not arg.strip():
-            say("Usage: upload <file or folder>")
+            say("Usage: upload <file or folder> [more files or folders...]")
             return
-        path = clean_path_arg(arg)
-        if not os.path.exists(path):
-            say("[!] Not found: %s" % path)
+        paths, missing = parse_paths(arg)
+        for m in missing:
+            say("[!] Not found: %s" % m)
+        if not paths:
             return
-        t = OutTransfer(self, path)
+        if len(paths) > MAX_BATCH:
+            say("[!] That is %d items; one upload can offer up to %d. Put them in a folder and upload the folder "
+                "(any number of files), or upload them in parts." % (len(paths), MAX_BATCH))
+            return
         with self.lock:
-            self.outgoing[t.tid] = t
-        threading.Thread(target=t.run, daemon=True).start()
+            busy = set(os.path.normcase(t.path) for t in self.outgoing.values() if not t.terminal())
+        items = []
+        for p in paths:
+            ap = os.path.abspath(p)
+            if os.path.normcase(ap) in busy:
+                say("[!] %s is already being sent." % (os.path.basename(ap.rstrip("\\/")) or ap))
+                continue
+            busy.add(os.path.normcase(ap))
+            items.append(OutTransfer(self, ap))
+        if not items:
+            return
+        batch = Batch(items)
+        with self.lock:
+            for t in items:
+                t.batch = batch
+                t.num = self.next_num()
+                self.outgoing[t.tid] = t
+        threading.Thread(target=self._start_batch, args=(batch,), daemon=True).start()
+
+    def _start_batch(self, batch):
+        ok = [t for t in batch.members if t.prepare()]
+        batch.members = ok
+        if not ok:
+            self.transfer_ended()
+            return
+        if len(ok) > 1:
+            if self.session_alive():
+                say("[*] Offered %s. Waiting for the other user to answer..." % batch.describe())
+            else:
+                say("[*] %s will be offered as soon as the other user is connected." % batch.describe())
+        for t in ok:
+            threading.Thread(target=t.run, daemon=True).start()
+
+    @staticmethod
+    def _agg(label, rows, note):
+        size = sum(r[1] for r in rows)
+        done = sum(r[2] for r in rows)
+        rate = sum(r[3] for r in rows)
+        pct = 100.0 * done / size if size else 100.0
+        eta = (size - done) / rate if rate > 0 else None
+        name = short(rows[0][0], 18) if len(rows) == 1 else "%d items" % len(rows)
+        return "%s %s %.1f%% %s/%s %s/s ETA %s%s" % (label, name, pct, human(done), human(size),
+                                                     human(rate), fmt_eta(eta), note)
 
     def status_line(self):
+        alive = self.session_alive()
+        ups = [t for t in list(self.outgoing.values()) if t.accepted_once and not t.terminal()]
+        downs = [t for t in list(self.incoming.values()) if t.state == "active"]
         parts = []
-        for t in list(self.outgoing.values()):
-            if t.state == "sending" or (t.accepted_once and not t.terminal()):
-                pct = 100.0 * t.acked / t.size if t.size else 100.0
-                rate = t.meter.rate()
-                eta = (t.size - t.acked) / rate if rate > 0 else None
-                paused = "" if (self.session_alive() and t.state == "sending") else " paused"
-                parts.append("UP %s %.1f%% %s/%s %s/s ETA %s%s" % (
-                    short(t.name, 18), pct, human(t.acked), human(t.size), human(rate), fmt_eta(eta), paused))
-        for t in list(self.incoming.values()):
-            if t.state == "active":
-                pct = 100.0 * t.written / t.size if t.size else 100.0
-                rate = t.meter.rate()
-                eta = (t.size - t.written) / rate if rate > 0 else None
-                paused = "" if self.session_alive() else " paused"
-                parts.append("DOWN %s %.1f%% %s/%s %s/s ETA %s%s" % (
-                    short(t.name, 18), pct, human(t.written), human(t.size), human(rate), fmt_eta(eta), paused))
+        if ups:
+            note = "" if alive else " paused"
+            if alive and len(ups) == 1 and ups[0].state == "queued":
+                note = " queued"
+            parts.append(self._agg("UP", [(t.name, t.size, t.acked, t.meter.rate()) for t in ups], note))
+        if downs:
+            parts.append(self._agg("DOWN", [(t.name, t.size, t.written, t.meter.rate()) for t in downs],
+                                   "" if alive else " paused"))
         return " | ".join(parts)
 
     def print_status(self):
@@ -2571,36 +2999,70 @@ class App(object):
             say("[*] Not connected. %s" % ("Trying %s" % self.dialer.raw if self.dialer.has_target()
                                             else "Waiting for the other user to connect."))
         say("[*] Listening on port %d. Downloads folder: %s" % (self.port, self.download_dir))
-        line = self.status_line()
-        say("[*] Transfers: %s" % (line or "none active"))
+        rows = []
+        for t in list(self.outgoing.values()):
+            if t.terminal():
+                continue
+            if t.state == "sending" or (t.accepted_once and t.state != "queued"):
+                what = "%.1f%% of %s, %s/s" % (100.0 * t.acked / t.size if t.size else 100.0, human(t.size),
+                                               human(t.meter.rate()))
+            else:
+                what = {"preparing": "preparing", "waiting": "waiting for the connection",
+                        "offered": "waiting for the other user's answer",
+                        "queued": "accepted, waiting its turn"}.get(t.state, t.state)
+                what += ", %s" % human(t.size)
+            rows.append((t.num, "UP  ", t.name, what))
+        for t in list(self.incoming.values()):
+            if t.state == "active":
+                what = "%.1f%% of %s, %s/s" % (100.0 * t.written / t.size if t.size else 100.0, human(t.size),
+                                               human(t.meter.rate()))
+            elif t.state == "asking":
+                what = "waiting for your y/n answer, %s" % human(t.size)
+            else:
+                continue
+            rows.append((t.num, "DOWN", t.name, what))
+        if not rows:
+            say("[*] Transfers: none running.")
+            return
+        say("[*] Transfers (cancel <number> stops one, cancel or Ctrl+Z stops all):")
+        for num, d, name, what in sorted(rows):
+            say("    #%-3d %s %-32s %s" % (num, d, short(name, 32), what))
 
     def help(self):
         say("Commands:\n"
-            "  upload <file or folder>  offer a file or folder (any type, any size)\n"
-            "  cancel  or Ctrl+Z        stop the current upload/download, stay connected\n"
+            "  upload <files/folders>   offer one or more files/folders (any type, any size)\n"
+            "                           e.g. upload movie.mp4 \"My Photos\" notes.pdf   or   upload *.jpg\n"
+            "  cancel  or Ctrl+Z        stop all running uploads/downloads, stay connected\n"
+            "  cancel <number>          stop just one (see the numbers with status)\n"
             "  connect <address>        connect to a new address (e.g. a new tunnel URL)\n"
-            "  status                   connection and transfer details\n"
-            "  exit    or Ctrl+C        quit")
+            "  status                   connection and every transfer with its number\n"
+            "  exit    or Ctrl+C        quit\n"
+            "You can upload more at any time, even while other files are still moving.")
 
     def handle_line(self, line):
         with self.lock:
             asking = bool(self.prompts)
         if asking:
             word = line.strip().split(" ", 1)[0].lower()
-            if word not in ("cancel", "exit", "quit", "upload", "status", "help", "connect"):
+            if word not in ("cancel", "stop", "exit", "quit", "upload", "send", "status", "list", "help", "connect"):
                 self.answer_prompt(line)
                 return
         cmd, _, arg = line.strip().partition(" ")
         c = cmd.lower()
         if not c:
             return
-        if c in ("upload", "up", "send", "u"):
+        if c in ("y", "n", "yes", "no") and not arg:
+            say("[*] No download question is open right now.")
+        elif c in ("upload", "up", "send", "u"):
             self.upload(arg)
         elif c in ("cancel", "stop"):
-            self.cancel_active()
+            if arg.strip():
+                self.cancel_number(arg)
+            else:
+                self.cancel_active()
         elif c in ("exit", "quit", "q"):
             raise KeyboardInterrupt
-        elif c == "status":
+        elif c in ("status", "list", "ls"):
             self.print_status()
         elif c == "connect":
             if arg.strip():
@@ -2610,8 +3072,9 @@ class App(object):
         elif c in ("help", "?", "h"):
             self.help()
         else:
-            if os.path.exists(clean_path_arg(line)):
-                self.upload(line)          # dragged a file in without typing 'upload'
+            paths, missing = parse_paths(line)
+            if paths and not missing:
+                self.upload(line)          # dragged files in without typing 'upload'
             else:
                 say("Unknown command. Type help to see the commands.")
 
@@ -2633,6 +3096,10 @@ class App(object):
             for s in sessions:
                 if s.alive and s.attached and now - s.last_rx > s.conn.dead_after:
                     s.kill()
+            try:
+                self.collect_overdue()
+            except Exception:
+                pass
 
     def shutdown(self):
         self.stopping = True
@@ -3187,6 +3654,10 @@ def install_ctrl_z(app):
 
 
 def main():
+    try:
+        threading.stack_size(512 * 1024)   # many small threads stay light on phones
+    except (ValueError, RuntimeError):
+        pass
     peer = PEER_ADDRESS
     port = PORT
     folder = DOWNLOAD_FOLDER
@@ -3211,7 +3682,7 @@ def main():
         say(" Same Wi-Fi? The other user can use: %s" % ", ".join("%s:%d" % (ip, port) for ip in ips))
     say(" Internet? Tunnel port %d with Pinggy or ngrok and share the address it prints." % port)
     say(" Downloads go to: %s" % download_dir)
-    say(" Commands: upload <path> | cancel (Ctrl+Z) | connect <address> | status | help | exit (Ctrl+C)")
+    say(" Commands: upload <files/folders> | cancel (Ctrl+Z) | status | connect <address> | help | exit (Ctrl+C)")
     say("=" * 60)
     if not peer.strip():
         say("[*] Waiting for the other user to connect...")
